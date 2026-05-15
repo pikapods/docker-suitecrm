@@ -43,7 +43,11 @@ class TestImageMetadata:
         assert user in ("www-data", "82"), f"expected www-data/82, got {user!r}"
 
     def test_healthcheck_defined(self, inspect):
-        assert inspect["Config"].get("Healthcheck"), "no Healthcheck defined"
+        # docker stores HEALTHCHECK at .Config.Healthcheck; podman surfaces it
+        # at top-level .Healthcheck. Accept either so the suite is portable
+        # across both daemons.
+        hc = inspect["Config"].get("Healthcheck") or inspect.get("Healthcheck")
+        assert hc, "no Healthcheck defined"
 
     def test_exposes_8080(self, inspect):
         ports = inspect["Config"].get("ExposedPorts") or {}

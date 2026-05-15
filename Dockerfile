@@ -41,7 +41,8 @@ RUN apk add --no-cache \
         zip \
         gnupg \
         exif \
-        opcache
+        opcache \
+    && rm -f /usr/bin/composer
 
 # Fetch and unpack the SuiteCRM release tarball. The zip unpacks to
 # SuiteCRM-X.Y.Z/ — strip that prefix so the app lands at /var/www/html.
@@ -71,7 +72,7 @@ RUN mkdir -p /data \
     && ln -s /data/upload              /var/www/html/upload \
     && ln -s /data/cache               /var/www/html/cache \
     && ln -s /data/runtime-data        /var/www/html/data \
-    && chown www-data:www-data /data \
+    && chown -R www-data:www-data /data \
     && chown -R www-data:www-data /var/www/html
 
 # Build-arg UID/GID override. See README "User & permissions".

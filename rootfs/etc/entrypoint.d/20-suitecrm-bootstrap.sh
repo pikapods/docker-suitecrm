@@ -80,6 +80,31 @@ if [ -s "$CONFIG_PHP" ] && grep -qE "installer_locked['\"]?[[:space:]]*=>[[:spac
     needs_install=0
 fi
 
+# Refuse to silent-install over a populated DB. setup_db_drop_tables=true
+# (set in config_si.php below) is destructive; the installer_locked check
+# above only proves THIS config volume hasn't been installed before, not
+# that the DB itself is empty. Guard against operators pointing a fresh
+# /data at a populated DB belonging to a different deployment.
+if [ "$needs_install" -eq 1 ]; then
+    existing_users_table=$(mysql -h "$DB_HOST" -P "$DB_PORT" \
+        -u "$DB_USER" --password="$DB_PASS" "$DB_NAME" \
+        -N -B -e \
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema='$DB_NAME' AND table_name='users'" 2>/dev/null \
+        || echo 0)
+    if [ "$existing_users_table" -gt 0 ]; then
+        user_count=$(mysql -h "$DB_HOST" -P "$DB_PORT" \
+            -u "$DB_USER" --password="$DB_PASS" "$DB_NAME" \
+            -N -B -e "SELECT COUNT(*) FROM users" 2>/dev/null || echo 0)
+        if [ "$user_count" -gt 0 ]; then
+            die "DB '$DB_NAME' already has a populated 'users' table but \
+this container's /data has no installer_locked marker. Refusing to \
+silent-install — it would drop your tables. Restore the matching /data \
+volume, or wipe the DB intentionally before retrying."
+        fi
+    fi
+fi
+
 # PHP-escape a single-quoted string literal: backslash and single-quote are
 # the only metacharacters inside '...' in PHP.
 php_squote() {
@@ -100,8 +125,13 @@ if [ "$needs_install" -eq 1 ]; then
 
     # Keys verified against install/install_utils.php::pullSilentInstallVarsIntoSession()
     # at v7.15.1. setup_db_create_database/user=false: we expect the DB and user
-    # to already exist (compose provisions them); setup_db_drop_tables=false to
-    # avoid clobbering a pre-existing instance if the operator pointed us at one.
+    # to already exist (compose provisions them). setup_db_drop_tables=true is
+    # required for the installer to call create_default_users() and seed the
+    # admin row — with drop_tables=false performSetup.php branches to
+    # set_admin_password() instead, which assumes user #1 already exists and
+    # silently leaves the users table empty. Safe because we gate this whole
+    # block on installer_locked!=true AND probe for a populated users table
+    # above before reaching this point.
     cat > "${APP_DIR}/config_si.php" <<PHP
 <?php
 \$sugar_config_si = array(
@@ -117,7 +147,7 @@ if [ "$needs_install" -eq 1 ]; then
     'setup_db_sugarsales_password'      => '${DB_PASS_E}',
     'setup_db_create_database'          => false,
     'setup_db_create_sugarsales_user'   => false,
-    'setup_db_drop_tables'              => false,
+    'setup_db_drop_tables'              => true,
     'setup_db_collation'                => 'utf8_general_ci',
     'setup_db_charset'                  => 'utf8',
     'setup_site_admin_user_name'        => '${ADMIN_USER_E}',

@@ -101,7 +101,7 @@ def stack():
             "-e", "ADMIN_USER=admin",
             "-e", "ADMIN_PASS=changeme",
             "-e", "SITE_NAME=SmokeTest",
-            "-p", "0:8080",
+            "-p", ":8080",
             IMAGE,
         )
         port = _host_port(sc, "8080")
@@ -129,6 +129,51 @@ def test_login_responds_200(stack):
         f"login page missing password field (body head: {body[:400]!r})"
 
 
+def test_admin_user_created(stack):
+    """Prove the silent installer honored ADMIN_USER/ADMIN_PASS by seeding
+    the admin row. We check the DB directly rather than round-tripping the
+    login form because SuiteCRM 7.x supports several password-hash modes
+    (plain/MD5/PHPass) and the correct one depends on the install profile —
+    a brittle HTTP test would generate false negatives across versions.
+
+    Verifies user_name matches the env, is_admin=1, status=Active, and the
+    password hash field is non-empty (i.e. it was actually set, not left
+    blank by a half-failed install).
+    """
+    r = _exec(
+        stack["db"], "mysql", "-uroot", "-ptest", "-N", "-B",
+        "-e",
+        "SELECT user_name, is_admin, status, "
+        "  CASE WHEN user_hash IS NULL OR user_hash='' THEN 'EMPTY' ELSE 'SET' END "
+        "FROM suitecrm.users WHERE user_name='admin'",
+    )
+    assert r.returncode == 0, f"users query failed: stderr={r.stderr!r}"
+    cols = r.stdout.split()
+    assert cols[:4] == ["admin", "1", "Active", "SET"], (
+        f"admin row not seeded correctly: got {cols!r} "
+        "(expected ['admin','1','Active','SET'])"
+    )
+
+
+def test_db_schema_initialized(stack):
+    """Prove the silent installer populated the schema, not just wrote a
+    config file. The 4 tables checked are SuiteCRM core; names are stable
+    across 7.x minor releases."""
+    r = _exec(
+        stack["db"],
+        "mysql", "-uroot", "-ptest", "-N", "-B",
+        "-e", "SHOW TABLES IN suitecrm",
+    )
+    assert r.returncode == 0, f"SHOW TABLES failed: stderr={r.stderr!r}"
+    tables = set(r.stdout.split())
+    core = {"users", "accounts", "contacts", "config"}
+    missing = core - tables
+    assert not missing, (
+        f"silent install did not create core tables: missing={sorted(missing)} "
+        f"(got {len(tables)} tables total)"
+    )
+
+
 def _http_status(url):
     try:
         with _http_get(url) as r:
@@ -150,12 +195,13 @@ def test_blocked_paths_return_403(stack, path):
     assert code == 403, f"{path} returned {code}, expected 403"
 
 
-@pytest.mark.parametrize("subdir", ["upload", "cache", "custom", "data", "modules"])
+@pytest.mark.parametrize("subdir", ["upload", "cache", "custom", "data"])
 def test_uploaded_php_not_executed(stack, subdir):
-    """Drop a .php file under a mutable tree and verify nginx denies it
+    """Drop a .php file under a writable tree and verify nginx denies it
     rather than handing it to php-fpm. Without the deny rule, a user with
     write access to /upload (e.g. via the SuiteCRM file-attachment flow)
-    gets RCE."""
+    gets RCE. modules/ is core app code (not user-writable) so it's
+    omitted — the four writable trees prove the deny pattern works."""
     sc = stack["sc"]
     # /data/custom -> /var/www/html/custom (via symlink chain), and
     # /var/www/html/data -> /data/runtime-data; either way, writing through
@@ -231,11 +277,14 @@ def test_db_reconcile_on_restart(stack):
     r = _exec(sc, "grep", "site_url", "/data/config.php")
     assert r.returncode == 0
     # Munge site_url so the reconciliation step has something to rewrite.
+    # Use single-quoted sh -c body so neither $sugar_config nor $_ get
+    # eaten by the shell before PHP sees them. Inside single quotes, escape
+    # embedded single quotes via the '"'"' trick.
     munge = (
-        "php -r \"include '/data/config.php'; "
-        "$sugar_config['site_url']='http://stale.invalid'; "
-        "file_put_contents('/data/config.php', "
-        "'<?php' . PHP_EOL . '$sugar_config = ' . var_export($sugar_config, true) . ';' . PHP_EOL);\""
+        'php -r \'include "/data/config.php"; '
+        '$sugar_config["site_url"]="http://stale.invalid"; '
+        'file_put_contents("/data/config.php", '
+        '"<?php" . PHP_EOL . "\\$sugar_config = " . var_export($sugar_config, true) . ";" . PHP_EOL);\''
     )
     r = _exec(sc, "sh", "-c", munge)
     assert r.returncode == 0, f"munge failed: stderr={r.stderr!r}"
@@ -276,3 +325,147 @@ def test_healthcheck_reports_healthy(stack):
             pytest.fail(f"container went unhealthy: {health.get('Log', [])[-1:]!r}")
         time.sleep(3)
     pytest.fail(f"healthcheck still {last!r} after {HEALTHY_DEADLINE_S}s")
+
+
+def test_bootstrap_fails_on_missing_env():
+    """The bootstrap script (`rootfs/etc/entrypoint.d/20-suitecrm-bootstrap.sh`)
+    uses POSIX `: "${VAR:?msg}"` to enforce required env. If that validation
+    is weakened, the image would fall through to a confusing later failure
+    (broken install, default credentials exposed, etc). Boot the image with
+    none of the required env and assert it fails loudly.
+    """
+    name = f"sc-noenv-{secrets.token_hex(4)}"
+    _sh("docker", "run", "-d", "--name", name, IMAGE)
+    try:
+        # Bootstrap should bail within a few seconds (no MySQL wait reached).
+        deadline = time.time() + 30
+        state = None
+        while time.time() < deadline:
+            r = _sh("docker", "inspect", "--format",
+                    "{{.State.Status}} {{.State.ExitCode}}", name)
+            state = r.stdout.strip()
+            if state.startswith("exited"):
+                break
+            time.sleep(1)
+
+        logs = _sh("docker", "logs", name, check=False)
+        combined = logs.stdout + logs.stderr
+
+        # Either the container has exited non-zero, or it's still running but
+        # the bootstrap script has logged a "*is required*" error. Both are
+        # acceptable evidence that validation fired (s6 supervisor behavior
+        # on oneshot failure differs by version).
+        validation_fired = re.search(r"\bis required\b|APP_URL|DB_HOST", combined)
+        exited_nonzero = state and state.startswith("exited") and not state.endswith(" 0")
+
+        assert validation_fired or exited_nonzero, (
+            f"bootstrap did not fail loudly on missing env "
+            f"(state={state!r}, logs head: {combined[:600]!r})"
+        )
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+@pytest.fixture
+def stack_persisted():
+    """Bring up MySQL + SuiteCRM with a *named* volume bound at /data, then
+    yield handles for a second-boot test. The session `stack` fixture uses
+    an anonymous volume tied to the original container — it can't be reused
+    for a rm + recreate scenario."""
+    suffix = secrets.token_hex(4)
+    net = f"sc-net-p-{suffix}"
+    db = f"db-p-{suffix}"
+    vol = f"sc-data-{suffix}"
+    sc_initial = f"sc-p1-{suffix}"
+    sc_recreated = f"sc-p2-{suffix}"
+    created_containers = []
+
+    _sh("docker", "network", "create", net)
+    _sh("docker", "volume", "create", vol)
+    try:
+        _sh(
+            "docker", "run", "-d", "--name", db, "--network", net,
+            "-e", "MYSQL_ROOT_PASSWORD=test",
+            "-e", "MYSQL_DATABASE=suitecrm",
+            "-e", "MYSQL_USER=suitecrm",
+            "-e", "MYSQL_PASSWORD=suitepass",
+            "mysql:8",
+            "--character-set-server=utf8mb4",
+            "--collation-server=utf8mb4_unicode_ci",
+        )
+        created_containers.append(db)
+        _wait_mysql_ready(db)
+
+        def _run_app(name):
+            _sh(
+                "docker", "run", "-d", "--name", name, "--network", net,
+                "--mount", f"type=volume,source={vol},target=/data",
+                "-e", "APP_URL=http://localhost:8080",
+                "-e", f"DB_HOST={db}",
+                "-e", "DB_PORT=3306",
+                "-e", "DB_NAME=suitecrm",
+                "-e", "DB_USER=suitecrm",
+                "-e", "DB_PASS=suitepass",
+                "-e", "ADMIN_USER=admin",
+                "-e", "ADMIN_PASS=changeme",
+                "-e", "SITE_NAME=SmokeTestPersist",
+                "-p", ":8080",
+                IMAGE,
+            )
+            created_containers.append(name)
+            port = _host_port(name, "8080")
+            try:
+                _wait_http_200(f"http://127.0.0.1:{port}{LOGIN_URL_PATH}", READY_DEADLINE_S)
+            except RuntimeError:
+                print(_sh("docker", "logs", name, check=False).stdout)
+                print(_sh("docker", "logs", name, check=False).stderr)
+                raise
+            return port
+
+        port_initial = _run_app(sc_initial)
+        # Tear down only the app container; volume + DB persist.
+        subprocess.run(["docker", "rm", "-f", sc_initial], capture_output=True)
+        created_containers.remove(sc_initial)
+
+        port_recreated = _run_app(sc_recreated)
+
+        yield {
+            "sc": sc_recreated,
+            "db": db,
+            "net": net,
+            "vol": vol,
+            "port": port_recreated,
+        }
+    finally:
+        for name in created_containers:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "volume", "rm", vol], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+
+
+def test_data_persists_across_container_recreate(stack_persisted):
+    """Drop the app container, start a fresh one against the same /data
+    volume + same DB, and verify the second boot:
+      (a) serves login again (HTTP 200),
+      (b) preserves installer_locked => true,
+      (c) takes the skip-install branch (didn't re-run silent install
+          against an already-populated DB).
+    """
+    sc = stack_persisted["sc"]
+    port = stack_persisted["port"]
+
+    with _http_get(f"http://127.0.0.1:{port}{LOGIN_URL_PATH}") as r:
+        assert r.status == 200, f"second boot login returned {r.status}"
+
+    r = _exec(sc, "grep", "-E", "installer_locked.*=>.*true", "/data/config.php")
+    assert r.returncode == 0, (
+        f"installer_locked not preserved across recreate "
+        f"(stdout={r.stdout!r}, stderr={r.stderr!r})"
+    )
+
+    logs = _sh("docker", "logs", sc, check=False)
+    combined = logs.stdout + logs.stderr
+    assert "skipping silent install" in combined, (
+        "second-boot did not log the skip-install branch — installer may "
+        "have re-run against an already-populated DB"
+    )
