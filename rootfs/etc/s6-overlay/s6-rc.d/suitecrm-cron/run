@@ -1,0 +1,24 @@
+#!/command/with-contenv sh
+# SuiteCRM cron — per-minute `php -f cron.php` loop.
+# Drives Schedulers (inbound email, workflows, reminders, AOR reports).
+# Approximates cron's minute boundary without dragging in dcron.
+
+# When disabled, idle in a portable long-sleep loop. BusyBox's `sleep infinity`
+# works on recent builds but older Alpine versions reject the literal; this
+# form runs on every sh + sleep combo.
+if [ "${ENABLE_SUITECRM_CRON:-TRUE}" != "TRUE" ]; then
+    while :; do sleep 3600; done
+fi
+
+cd /var/www/html || exit 1
+
+while :; do
+    start=$(date +%s)
+    # BusyBox timeout (Alpine) uses short flags: -s SIG, -k SECS, then DURATION.
+    timeout -s TERM -k 5 55 \
+        php -f cron.php >&2 || true
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -lt 60 ]; then
+        sleep $(( 60 - elapsed ))
+    fi
+done

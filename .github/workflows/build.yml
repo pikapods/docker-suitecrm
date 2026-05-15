@@ -1,0 +1,247 @@
+name: Build and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      suitecrm_version:
+        description: "SuiteCRM version (e.g. 7.15.1)"
+        required: true
+        type: string
+      php_version:
+        description: "PHP minor version"
+        required: false
+        default: "8.4"
+        type: string
+      publish:
+        description: "Publish to GHCR after tests pass"
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      suitecrm_version: ${{ steps.vars.outputs.suitecrm_version }}
+      php_version: ${{ steps.vars.outputs.php_version }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve build args
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SC_VER="${{ inputs.suitecrm_version }}"
+            PHP_VER="${{ inputs.php_version }}"
+          else
+            # Tag form: v<suitecrm-version> (e.g. v7.15.1)
+            SC_VER="${GITHUB_REF_NAME#v}"
+            PHP_VER="8.4"
+          fi
+          echo "suitecrm_version=$SC_VER" >>"$GITHUB_OUTPUT"
+          echo "php_version=$PHP_VER"      >>"$GITHUB_OUTPUT"
+          echo "image_tag=${SC_VER}-php${PHP_VER}" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (local load)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            SUITECRM_VERSION=${{ steps.vars.outputs.suitecrm_version }}
+            PHP_VERSION=${{ steps.vars.outputs.php_version }}
+          tags: suitecrm:test
+          provenance: false
+
+      - name: Save image tarball
+        run: docker save suitecrm:test -o /tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/requirements.txt
+
+      - name: Image + runtime tests
+        env:
+          IMAGE: suitecrm:test
+        run: pytest -v tests/ --junitxml=report.xml
+
+      - name: Dump suitecrm container logs on failure
+        if: failure()
+        run: |
+          for c in $(docker ps -a --filter "name=^sc-" --format '{{.Names}}'); do
+            echo "--- $c ---"
+            docker logs "$c" 2>&1 || true
+          done
+
+      - name: Upload pytest report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-report
+          path: report.xml
+          retention-days: 7
+
+  compose-test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - name: Bring up compose stack
+        env:
+          SUITECRM_IMAGE: suitecrm:test
+        run: docker compose up -d
+
+      - name: Wait for login page to return 200
+        run: |
+          # Silent install on cold MySQL boot can take 60-180s; 300s budget.
+          for i in $(seq 1 150); do
+            code=$(curl -sf -o /dev/null -w '%{http_code}' \
+              'http://localhost:8080/index.php?module=Users&action=Login' || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "ready after ${i} polls"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "timed out waiting for login page"
+          exit 1
+
+      - name: Assert healthcheck propagated
+        run: |
+          for i in $(seq 1 18); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' suitecrm-suitecrm-1)
+            echo "health status: $status"
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              echo "container reported unhealthy"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "timed out waiting for healthy status"
+          exit 1
+
+      - name: Assert clean first boot
+        run: |
+          restarts=$(docker inspect --format '{{.RestartCount}}' suitecrm-suitecrm-1)
+          echo "restart count: $restarts"
+          [ "$restarts" = "0" ] || exit 1
+          if docker compose logs suitecrm 2>&1 | grep -E 'not reachable|FATAL|Restarting'; then
+            echo "found error markers in suitecrm logs"
+            exit 1
+          fi
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    needs: [build, test, compose-test]
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Push three refs to each registry:
+      #   <version>-php<minor>   fully qualified
+      #   <version>              plain SuiteCRM version alias
+      #   latest
+      - name: Tag and push
+        env:
+          SC_VER: ${{ needs.build.outputs.suitecrm_version }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/docker-suitecrm
+        run: |
+          set -euo pipefail
+          for REPO in "${REGISTRY}/${IMAGE_NAME}" "docker.io/${DOCKERHUB_REPO}"; do
+            docker tag suitecrm:test "${REPO}:${IMAGE_TAG}"
+            docker tag suitecrm:test "${REPO}:${SC_VER}"
+            docker tag suitecrm:test "${REPO}:latest"
+            docker push "${REPO}:${IMAGE_TAG}"
+            docker push "${REPO}:${SC_VER}"
+            docker push "${REPO}:latest"
+          done

@@ -1,0 +1,74 @@
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "18 * * * *"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PHP_VERSION: "8.4"
+  # Pinned upstream series (major.minor). Auto-rebuilds only fire for patch
+  # bumps within this line, e.g. 7.15.1 -> 7.15.2. Bump this manually to
+  # opt into a new series; use workflow_dispatch on build.yml for one-off
+  # out-of-series builds.
+  SERIES: "7.15"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      packages: read
+    steps:
+      - name: Compare upstream release to published tags
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          upstream=$(gh api repos/SuiteCRM/SuiteCRM/releases/latest --jq .tag_name)
+          echo "upstream=${upstream}"
+
+          # Strip leading 'v' if present, then take everything before the last dot.
+          upstream_series="${upstream#v}"
+          upstream_series="${upstream_series%.*}"
+          if [ "${upstream_series}" != "${SERIES}" ]; then
+            echo "upstream ${upstream} is outside pinned series ${SERIES}; skipping auto-rebuild"
+            echo "published=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Strip leading 'v' from the registry-tag lookup — we publish as
+          # plain `7.15.1`, not `v7.15.1`.
+          upstream_tag="${upstream#v}"
+
+          # Ask GHCR's OCI registry whether the tag is already published.
+          token=$(curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -r .token)
+
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${upstream_tag}")
+
+          if [ "${status}" = "200" ]; then
+            echo "published=true"  >>"$GITHUB_OUTPUT"
+            echo "${upstream} already published"
+          else
+            echo "published=false" >>"$GITHUB_OUTPUT"
+            echo "upstream=${upstream_tag}" >>"$GITHUB_OUTPUT"
+            echo "${upstream} not in registry (HTTP ${status}); will trigger build"
+          fi
+
+      - name: Trigger build
+        if: steps.check.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build.yml \
+            -f suitecrm_version='${{ steps.check.outputs.upstream }}' \
+            -f php_version='${{ env.PHP_VERSION }}'

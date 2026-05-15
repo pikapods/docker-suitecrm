@@ -1,0 +1,47 @@
+name: suitecrm
+
+services:
+  mysql:
+    image: mysql:8
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: suitecrm
+      MYSQL_USER: suitecrm
+      MYSQL_PASSWORD: changeme            # change before any real deployment
+      MYSQL_ROOT_PASSWORD: changemetoo    # change before any real deployment
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-pchangemetoo"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
+  suitecrm:
+    image: ${SUITECRM_IMAGE:-ghcr.io/pikapods/docker-suitecrm:latest}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      APP_URL: http://localhost:8080
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: suitecrm
+      DB_USER: suitecrm
+      DB_PASS: changeme
+      ADMIN_USER: admin
+      ADMIN_PASS: changeme
+      SITE_NAME: SuiteCRM
+    volumes:
+      - suitecrm-data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  suitecrm-data:
