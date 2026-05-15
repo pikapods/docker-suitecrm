@@ -155,7 +155,7 @@ PHP
     port_deadline=$(( $(date +%s) + 10 ))
     while :; do
         code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
-            'http://127.0.0.1:8765/install.php' 2>/dev/null || echo "000")
+            'http://127.0.0.1:8765/install.php' 2>/dev/null || true)
         if [ "$code" != "000" ]; then
             break
         fi
@@ -231,7 +231,7 @@ if (!isset(\$sugar_config['dbconfig']) || !is_array(\$sugar_config['dbconfig']))
 \$sugar_config['dbconfig']['db_name']         = '${DB_NAME_E}';
 \$sugar_config['dbconfig']['db_type']         = 'mysql';
 \$sugar_config['dbconfig']['db_manager']      = 'MysqliManager';
-\$dump = \"<?php\n\$sugar_config = \" . var_export(\$sugar_config, true) . \";\n\";
+\$dump = \"<?php\n\" . '\$sugar_config = ' . var_export(\$sugar_config, true) . \";\n\";
 if (file_put_contents(\$config_path, \$dump) === false) {
     fwrite(STDERR, \"could not write \$config_path\n\");
     exit(1);

@@ -61,7 +61,9 @@ RUN curl -fsSL -o /tmp/suitecrm.zip \
 #
 # /data/runtime-data avoids the /data <-> data/ name collision: SuiteCRM's
 # `data/` holds runtime caches & template files, while the volume root is /data.
-RUN rm -rf /var/www/html/custom /var/www/html/upload /var/www/html/cache /var/www/html/data \
+RUN mkdir -p /data \
+    && mv /var/www/html/data /data/runtime-data \
+    && rm -rf /var/www/html/custom /var/www/html/upload /var/www/html/cache \
     && rm -f /var/www/html/config.php /var/www/html/config_override.php \
     && ln -s /data/config.php          /var/www/html/config.php \
     && ln -s /data/config_override.php /var/www/html/config_override.php \
@@ -69,7 +71,6 @@ RUN rm -rf /var/www/html/custom /var/www/html/upload /var/www/html/cache /var/ww
     && ln -s /data/upload              /var/www/html/upload \
     && ln -s /data/cache               /var/www/html/cache \
     && ln -s /data/runtime-data        /var/www/html/data \
-    && mkdir -p /data \
     && chown www-data:www-data /data \
     && chown -R www-data:www-data /var/www/html
 
@@ -106,6 +107,7 @@ ENV AUTORUN_ENABLED=false \
     SSL_MODE=off \
     ENABLE_SUITECRM_CRON=TRUE \
     APP_BASE_DIR=/var/www/html \
+    NGINX_WEBROOT=/var/www/html \
     PHP_OPCACHE_ENABLE=1
 
 # Health endpoint hits the login page (cheap, no auth, exercises nginx + php-fpm).
