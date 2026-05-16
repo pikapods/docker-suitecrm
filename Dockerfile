@@ -8,16 +8,29 @@
 #     -t ghcr.io/pikapods/docker-suitecrm:7.15.1-php8.4 .
 
 ARG PHP_VERSION=8.4
-FROM serversideup/php:${PHP_VERSION}-fpm-nginx-alpine
+ARG BASE_IMAGE=serversideup/php:${PHP_VERSION}-fpm-nginx-alpine
+FROM ${BASE_IMAGE}
 
+ARG PHP_VERSION
 ARG SUITECRM_VERSION=7.15.1
 ARG SUITECRM_RELEASE_BASE=https://github.com/SuiteCRM/SuiteCRM/releases/download
+
+# CI supplies these; local builds get harmless defaults so `docker build` still
+# works without ceremony. IMAGE_REVISION=r0 marks an unpublished local build.
+ARG IMAGE_REVISION=r0
+ARG BASE_IMAGE_DIGEST=
+ARG VCS_REF=
+ARG BUILD_DATE=
 
 LABEL org.opencontainers.image.title="SuiteCRM" \
       org.opencontainers.image.description="Self-maintained SuiteCRM 7 container" \
       org.opencontainers.image.source="https://github.com/pikapods/docker-suitecrm" \
       org.opencontainers.image.licenses="AGPL-3.0" \
-      org.opencontainers.image.version="${SUITECRM_VERSION}"
+      org.opencontainers.image.version="${SUITECRM_VERSION}-${IMAGE_REVISION}" \
+      org.opencontainers.image.base.name="serversideup/php:${PHP_VERSION}-fpm-nginx-alpine" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 USER root
 

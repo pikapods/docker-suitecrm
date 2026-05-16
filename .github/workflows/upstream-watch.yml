@@ -23,8 +23,18 @@ jobs:
       actions: write
       packages: read
     steps:
-      - name: Compare upstream release to published tags
-        id: check
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR (label reads)
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Trigger 1: new upstream SuiteCRM patch in the pinned series.
+      - name: Check for new upstream release
+        id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -37,14 +47,14 @@ jobs:
           upstream_series="${upstream#v}"
           upstream_series="${upstream_series%.*}"
           if [ "${upstream_series}" != "${SERIES}" ]; then
-            echo "upstream ${upstream} is outside pinned series ${SERIES}; skipping auto-rebuild"
-            echo "published=true" >>"$GITHUB_OUTPUT"
+            echo "upstream ${upstream} is outside pinned series ${SERIES}; skipping new-version trigger"
+            echo "needs_build=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Strip leading 'v' from the registry-tag lookup — we publish as
-          # plain `7.15.1`, not `v7.15.1`.
+          # We publish as plain `7.15.1`, not `v7.15.1`.
           upstream_tag="${upstream#v}"
+          echo "upstream_tag=${upstream_tag}" >>"$GITHUB_OUTPUT"
 
           # Ask GHCR's OCI registry whether the tag is already published.
           token=$(curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -r .token)
@@ -56,19 +66,94 @@ jobs:
             "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${upstream_tag}")
 
           if [ "${status}" = "200" ]; then
-            echo "published=true"  >>"$GITHUB_OUTPUT"
+            echo "needs_build=false" >>"$GITHUB_OUTPUT"
             echo "${upstream} already published"
           else
-            echo "published=false" >>"$GITHUB_OUTPUT"
-            echo "upstream=${upstream_tag}" >>"$GITHUB_OUTPUT"
+            echo "needs_build=true" >>"$GITHUB_OUTPUT"
             echo "${upstream} not in registry (HTTP ${status}); will trigger build"
           fi
 
-      - name: Trigger build
-        if: steps.check.outputs.published == 'false'
+      - name: Trigger build (new upstream version)
+        if: steps.upstream.outputs.needs_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run build.yml \
-            -f suitecrm_version='${{ steps.check.outputs.upstream }}' \
+            -f suitecrm_version='${{ steps.upstream.outputs.upstream_tag }}' \
             -f php_version='${{ env.PHP_VERSION }}'
+
+      # Trigger 2: base-image digest drift. Scoped to the latest in-series
+      # tag — that's the one most users pull, and `crane config` against the
+      # mutable `<ver>` ref reflects whichever revision currently floats.
+      #
+      # Skipped when trigger 1 already kicked off a build: that build will
+      # pick up the current base anyway, and racing two builds against the
+      # same SC version would fight over the same rN slot (concurrency
+      # serialises them, but the second is wasted work).
+      - name: Check for base image drift
+        id: drift
+        if: steps.upstream.outputs.needs_build != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Latest published in-series tag. Use the upstream tag if it's
+          # in-series (covers the case where trigger 1 saw it as already
+          # published); otherwise fall back to enumerating published tags.
+          if [ -n "${{ steps.upstream.outputs.upstream_tag }}" ]; then
+            latest_stable='${{ steps.upstream.outputs.upstream_tag }}'
+          else
+            # Trigger 1 skipped because upstream went outside SERIES.
+            # Find the newest in-series tag we've published instead.
+            token=$(curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -r .token)
+            latest_stable=$(curl -fsS \
+              -H "Authorization: Bearer ${token}" \
+              "https://${REGISTRY}/v2/${IMAGE_NAME}/tags/list" \
+              | jq -r --arg s "${SERIES}." \
+                  '.tags[] | select(startswith($s)) | select(test("-r[0-9]+$") | not)' \
+              | sort -V | tail -n1)
+          fi
+
+          if [ -z "${latest_stable}" ]; then
+            echo "no in-series tag published yet; nothing to drift-check"
+            exit 0
+          fi
+          echo "checking drift against ${latest_stable}"
+
+          BASE_REF="serversideup/php:${PHP_VERSION}-fpm-nginx-alpine"
+          current_digest=$(crane digest "${BASE_REF}")
+          echo "current base digest: ${current_digest}"
+
+          REF="${REGISTRY}/${IMAGE_NAME}:${latest_stable}"
+          if ! cfg=$(crane config "${REF}" 2>/dev/null); then
+            echo "could not read ${REF} config; skipping drift check"
+            exit 0
+          fi
+
+          published_digest=$(echo "${cfg}" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty')
+          if [ -z "${published_digest}" ]; then
+            echo "no image.base.digest label on ${REF} (pre-revision-scheme build); skipping"
+            exit 0
+          fi
+          echo "published base digest: ${published_digest}"
+
+          if [ "${published_digest}" = "${current_digest}" ]; then
+            echo "no base drift"
+            exit 0
+          fi
+
+          echo "drift detected; will trigger rebuild"
+          echo "needs_build=true" >>"$GITHUB_OUTPUT"
+          echo "suitecrm_version=${latest_stable}" >>"$GITHUB_OUTPUT"
+          echo "base_digest=${current_digest}"     >>"$GITHUB_OUTPUT"
+
+      - name: Trigger build (base drift)
+        if: steps.drift.outputs.needs_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build.yml \
+            -f suitecrm_version='${{ steps.drift.outputs.suitecrm_version }}' \
+            -f php_version='${{ env.PHP_VERSION }}' \
+            -f base_digest='${{ steps.drift.outputs.base_digest }}'

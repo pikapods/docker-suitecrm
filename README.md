@@ -12,6 +12,20 @@ Published to both `ghcr.io/pikapods/docker-suitecrm:<suitecrm-version>` and
 
 Source: https://github.com/pikapods/docker-suitecrm
 
+## Tags
+
+| Tag         | Mutability | Purpose                                                                                |
+|-------------|------------|----------------------------------------------------------------------------------------|
+| `latest`    | mutable    | Newest revision of the newest in-series SuiteCRM version.                              |
+| `X.Y.Z`     | mutable    | Newest revision of `X.Y.Z`. Receives base-image security rebuilds in place.            |
+| `X.Y.Z-rN`  | immutable  | Exact, reproducible build N of `X.Y.Z`. Never reassigned.                              |
+
+Most users want `X.Y.Z` (or `latest`) — those tags get rebuilt automatically
+when SuiteCRM ships a patch *or* when the upstream
+`serversideup/php` base image picks up Alpine/PHP security fixes, and each
+rebuild bumps the `-rN` suffix. Pin to `X.Y.Z-rN` when you need byte-for-byte
+reproducibility (audit trails, regulated rollouts).
+
 ## Why this image
 
 A small, maintainable SuiteCRM 7 image: a short entrypoint, idempotent boot
