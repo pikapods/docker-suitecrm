@@ -132,18 +132,21 @@ jobs:
           fi
 
           published_digest=$(echo "${cfg}" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty')
-          if [ -z "${published_digest}" ]; then
-            echo "no image.base.digest label on ${REF} (pre-revision-scheme build); skipping"
-            exit 0
-          fi
-          echo "published base digest: ${published_digest}"
+          echo "published base digest: ${published_digest:-<none>}"
 
-          if [ "${published_digest}" = "${current_digest}" ]; then
+          # Missing label = treat as drift. Self-bootstraps the scheme on
+          # images built before the label existed; any successful rebuild
+          # writes the label, so this can't loop.
+          if [ -n "${published_digest}" ] && [ "${published_digest}" = "${current_digest}" ]; then
             echo "no base drift"
             exit 0
           fi
 
-          echo "drift detected; will trigger rebuild"
+          if [ -z "${published_digest}" ]; then
+            echo "no image.base.digest label on ${REF}; bootstrapping via rebuild"
+          else
+            echo "drift detected; will trigger rebuild"
+          fi
           echo "needs_build=true" >>"$GITHUB_OUTPUT"
           echo "suitecrm_version=${latest_stable}" >>"$GITHUB_OUTPUT"
           echo "base_digest=${current_digest}"     >>"$GITHUB_OUTPUT"
