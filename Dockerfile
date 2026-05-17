@@ -75,9 +75,14 @@ RUN curl -fsSL -o /tmp/suitecrm.zip \
 #
 # /data/runtime-data avoids the /data <-> data/ name collision: SuiteCRM's
 # `data/` holds runtime caches & template files, while the volume root is /data.
-RUN mkdir -p /data \
-    && mv /var/www/html/data /data/runtime-data \
-    && rm -rf /var/www/html/custom /var/www/html/upload /var/www/html/cache \
+RUN mkdir -p /data /data/runtime-data /data/custom \
+        /usr/local/share/suitecrm-skel \
+    && cp -a /var/www/html/data   /usr/local/share/suitecrm-skel/data \
+    && cp -a /var/www/html/custom /usr/local/share/suitecrm-skel/custom \
+    && cp -a /var/www/html/data/.   /data/runtime-data/ \
+    && cp -a /var/www/html/custom/. /data/custom/ \
+    && rm -rf /var/www/html/data /var/www/html/custom \
+              /var/www/html/upload /var/www/html/cache \
     && rm -f /var/www/html/config.php /var/www/html/config_override.php \
     && ln -s /data/config.php          /var/www/html/config.php \
     && ln -s /data/config_override.php /var/www/html/config_override.php \

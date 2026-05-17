@@ -469,3 +469,154 @@ def test_data_persists_across_container_recreate(stack_persisted):
         "second-boot did not log the skip-install branch — installer may "
         "have re-run against an already-populated DB"
     )
+
+
+@pytest.fixture
+def stack_bindmount(tmp_path):
+    """Boot MySQL + SuiteCRM with a HOST BIND MOUNT at /data.
+
+    Bind mounts are not seeded by the container runtime (unlike named or
+    anonymous volumes, which the other fixtures use), so the bootstrap must
+    self-seed /data/runtime-data and /data/custom from the baked skeleton at
+    /usr/local/share/suitecrm-skel. This fixture is the only path in the
+    suite that exercises that branch — bind mounts are the typical pod-host
+    deployment shape, so coverage matters.
+
+    Cleanup: files inside the bind dir end up owned by the container UID
+    (www-data, 82), which the host test user can't rm. We wipe via a
+    throwaway container before letting tmp_path's cleanup run.
+    """
+    suffix = secrets.token_hex(4)
+    net = f"sc-net-b-{suffix}"
+    db = f"db-b-{suffix}"
+    sc = f"sc-b-{suffix}"
+    host_data = tmp_path / "data"
+    host_data.mkdir()
+    os.chmod(host_data, 0o777)  # container UID 82 must be able to write
+    created = []
+
+    _sh("docker", "network", "create", net)
+    try:
+        _sh(
+            "docker", "run", "-d", "--name", db, "--network", net,
+            "-e", "MYSQL_ROOT_PASSWORD=test",
+            "-e", "MYSQL_DATABASE=suitecrm",
+            "-e", "MYSQL_USER=suitecrm",
+            "-e", "MYSQL_PASSWORD=suitepass",
+            "mysql:8",
+            "--character-set-server=utf8mb4",
+            "--collation-server=utf8mb4_unicode_ci",
+        )
+        created.append(db)
+        _wait_mysql_ready(db)
+
+        _sh(
+            "docker", "run", "-d", "--name", sc, "--network", net,
+            "-v", f"{host_data}:/data:Z",
+            "-e", "APP_URL=http://localhost:8080",
+            "-e", f"DB_HOST={db}",
+            "-e", "DB_PORT=3306",
+            "-e", "DB_NAME=suitecrm",
+            "-e", "DB_USER=suitecrm",
+            "-e", "DB_PASS=suitepass",
+            "-e", "ADMIN_USER=admin",
+            "-e", "ADMIN_PASS=changeme",
+            "-e", "SITE_NAME=SmokeTestBind",
+            "-p", ":8080",
+            IMAGE,
+        )
+        created.append(sc)
+        port = _host_port(sc, "8080")
+        try:
+            _wait_http_200(f"http://127.0.0.1:{port}{LOGIN_URL_PATH}", READY_DEADLINE_S)
+        except RuntimeError:
+            print(_sh("docker", "logs", sc, check=False).stdout)
+            print(_sh("docker", "logs", sc, check=False).stderr)
+            raise
+
+        yield {"sc": sc, "db": db, "net": net, "port": port,
+               "host_data": str(host_data)}
+    finally:
+        for name in created:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+        # Wipe container-owned files so tmp_path cleanup doesn't EACCES.
+        subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{host_data}:/clean:Z",
+             "alpine", "sh", "-c",
+             "rm -rf /clean/* /clean/.[!.]* 2>/dev/null || true"],
+            capture_output=True,
+        )
+
+
+def test_bindmount_first_boot_seeds_and_idempotent_on_restart(stack_bindmount):
+    """End-to-end coverage of the bind-mount path that broke at pikapod:
+
+      (a) First boot: bootstrap MUST log seeding /data/runtime-data and
+          seeding /data/custom (the skeleton-copy step), HTTP 200, marker
+          files SuiteCRM needs at runtime present in the bind-mounted dir.
+      (b) Restart: seed steps MUST short-circuit (marker files present →
+          guards skip the cp), install MUST skip (installer_locked → true
+          persists), HTTP still 200.
+
+    Combined into one test because each bind-mount fixture instance costs
+    ~3 min (build + mysql + silent install); splitting would double it.
+    """
+    sc = stack_bindmount["sc"]
+    port = stack_bindmount["port"]
+
+    # --- (a) first boot ---
+    with _http_get(f"http://127.0.0.1:{port}{LOGIN_URL_PATH}") as r:
+        assert r.status == 200, f"first-boot login returned {r.status}"
+
+    logs1 = _sh("docker", "logs", sc, check=False)
+    combined1 = logs1.stdout + logs1.stderr
+    assert "seeding /data/runtime-data" in combined1, (
+        "first-boot bootstrap did not seed runtime-data — bind mount would "
+        "be missing data/SugarBean.php and install.php would 500. "
+        f"logs head: {combined1[:600]!r}"
+    )
+    assert "seeding /data/custom" in combined1, (
+        "first-boot bootstrap did not seed custom — Extension/ would be "
+        f"missing from /data/custom. logs head: {combined1[:600]!r}"
+    )
+
+    # Files the runtime actually opens — checked via container so we see them
+    # through the same symlink chain SuiteCRM uses.
+    for path, flag in [
+        ("/data/runtime-data/SugarBean.php", "-f"),
+        ("/data/runtime-data/Relationships", "-d"),
+        ("/data/custom/Extension",           "-d"),
+    ]:
+        r = _exec(sc, "test", flag, path)
+        assert r.returncode == 0, (
+            f"seed did not produce {path} in the bind-mounted /data "
+            "(install.php would fail on next boot from a fresh container)"
+        )
+
+    # --- (b) restart against the same bind mount ---
+    _sh("docker", "restart", sc)
+    port = _host_port(sc, "8080")  # may change across restart on some daemons
+    _wait_http_200(f"http://127.0.0.1:{port}{LOGIN_URL_PATH}", READY_DEADLINE_S)
+
+    with _http_get(f"http://127.0.0.1:{port}{LOGIN_URL_PATH}") as r:
+        assert r.status == 200, f"post-restart login returned {r.status}"
+
+    logs2 = _sh("docker", "logs", sc, check=False)
+    combined2 = logs2.stdout + logs2.stderr
+
+    # Seed lines from the first boot still sit in the log buffer (docker
+    # restart preserves the stream); the idempotency claim is that the seed
+    # step ran EXACTLY ONCE — i.e. it did not fire on the second boot.
+    assert combined2.count("seeding /data/runtime-data") == 1, (
+        "runtime-data seed ran more than once across restart — the marker-"
+        "file guard isn't catching the second boot, which would silently "
+        "overwrite user data on every restart."
+    )
+    assert combined2.count("seeding /data/custom") == 1, (
+        "custom seed ran more than once across restart — see above."
+    )
+    assert "skipping silent install" in combined2, (
+        "second boot did not log skip-install; installer may have re-run "
+        "and dropped the populated tables."
+    )

@@ -138,6 +138,30 @@ class TestImageFilesystem:
         assert r.returncode == 0, f"{path} missing"
 
 
+class TestImageSkeleton:
+    """The image ships a read-only skeleton of the upstream `data/` and
+    `custom/` trees at /usr/local/share/suitecrm-skel/. Bootstrap copies from
+    here on first boot when /data is a bind mount (no runtime volume seeding,
+    so /data/runtime-data and /data/custom would otherwise be empty and
+    install.php would fail with 'Failed opening required data/SugarBean.php').
+
+    Guards against silent regressions: if someone removes the skeleton from
+    the Dockerfile without also removing the bootstrap seed step, the bind-
+    mount path breaks at runtime instead of failing in CI.
+    """
+
+    @pytest.mark.parametrize("path,flag", [
+        ("/usr/local/share/suitecrm-skel/data/SugarBean.php",   "-f"),
+        ("/usr/local/share/suitecrm-skel/data/BeanFactory.php", "-f"),
+        ("/usr/local/share/suitecrm-skel/data/Relationships",   "-d"),
+        ("/usr/local/share/suitecrm-skel/custom/Extension",     "-d"),
+        ("/usr/local/share/suitecrm-skel/custom/index.html",    "-f"),
+    ])
+    def test_skeleton_present(self, path, flag):
+        r = _run("test", flag, path)
+        assert r.returncode == 0, f"skeleton path missing: {path}"
+
+
 @pytest.mark.runtime
 class TestCustomUidRebuild:
     """Rebuild with --build-arg WWW_DATA_UID/GID and verify the new UID

@@ -56,6 +56,24 @@ mkdir -p \
     "${DATA_DIR}/runtime-data"
 touch "${DATA_DIR}/config.php" "${DATA_DIR}/config_override.php"
 
+# Seed /data subtrees from the baked-in skeleton if marker files are missing.
+# Container runtimes only seed *named* volumes from the image filesystem; bind
+# mounts start empty, so without this step install.php fails with
+#   require 'data/SugarBean.php': No such file or directory
+# Marker-file guards make this idempotent (no-op on named-volume deploys and
+# on subsequent boots).
+SKEL=/usr/local/share/suitecrm-skel
+# cp -r (not -a) — the running container UID should own the seeded files; -a's
+# ownership-preservation fails noisily on non-root and we don't want it anyway.
+if [ ! -f "${DATA_DIR}/runtime-data/SugarBean.php" ]; then
+    log "seeding /data/runtime-data from ${SKEL}/data"
+    cp -r "${SKEL}/data/." "${DATA_DIR}/runtime-data/"
+fi
+if [ ! -d "${DATA_DIR}/custom/Extension" ]; then
+    log "seeding /data/custom from ${SKEL}/custom"
+    cp -r "${SKEL}/custom/." "${DATA_DIR}/custom/"
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Wait for MySQL. 30s deadline.
 # ---------------------------------------------------------------------------
