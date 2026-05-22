@@ -106,9 +106,14 @@ On first boot the bootstrap script:
 
 On every subsequent boot the bootstrap reconciles the live env values for
 `site_url`, `db_host_name`, `db_port`, `db_user_name`, `db_password`, and
-`db_name` into `/data/config.php`. **Other keys are preserved untouched** —
-the installer's `unique_key`, anything you've set via Studio or Admin Panel,
-custom mail tuning, etc.
+`db_name` into `/data/config.php`. It also merges the host parsed from `APP_URL`
+into `$sugar_config['http_referer']['list']` so that saving records works behind
+a reverse proxy — SuiteCRM's XSRF check compares the browser's `Referer` host
+against the in-container `SERVER_NAME` (which a proxy rewrites), not against
+`site_url`, so the public host must be explicitly trusted. **Other keys are
+preserved untouched** — the installer's `unique_key`, any extra
+`http_referer.list` entries or `http_referer.weak`/`actions` settings, anything
+you've set via Studio or Admin Panel, custom mail tuning, etc.
 
 Silent install logs are streamed to the container's stderr; on failure the
 response body is dumped (first 200 lines) before the container exits.

@@ -279,6 +279,26 @@ if (!isset(\$sugar_config['dbconfig']) || !is_array(\$sugar_config['dbconfig']))
 \$sugar_config['dbconfig']['db_name']         = '${DB_NAME_E}';
 \$sugar_config['dbconfig']['db_type']         = 'mysql';
 \$sugar_config['dbconfig']['db_manager']      = 'MysqliManager';
+// Trust the public host as an HTTP referer. SuiteCRM's checkHTTPReferer()
+// (include/MVC/SugarApplication.php) compares the browser's Referer host
+// against \$_SERVER['SERVER_NAME'], NOT site_url. Behind a reverse proxy the
+// in-container SERVER_NAME is the proxy-forwarded Host (effectively localhost),
+// never the public name, so every modify action (Save, …) trips the XSRF guard
+// unless the public host is whitelisted here. parse_url strips any port, which
+// is what checkHTTPReferer compares; the !empty guard skips a schemeless URL.
+// We only append to .list — never .actions, which would disable CSRF wholesale.
+\$ref_host = parse_url('${APP_URL_E}', PHP_URL_HOST);
+if (!empty(\$ref_host)) {
+    if (!isset(\$sugar_config['http_referer']) || !is_array(\$sugar_config['http_referer'])) {
+        \$sugar_config['http_referer'] = array();
+    }
+    if (!isset(\$sugar_config['http_referer']['list']) || !is_array(\$sugar_config['http_referer']['list'])) {
+        \$sugar_config['http_referer']['list'] = array();
+    }
+    if (!in_array(\$ref_host, \$sugar_config['http_referer']['list'], true)) {
+        \$sugar_config['http_referer']['list'][] = \$ref_host;
+    }
+}
 \$dump = \"<?php\n\" . '\$sugar_config = ' . var_export(\$sugar_config, true) . \";\n\";
 if (file_put_contents(\$config_path, \$dump) === false) {
     fwrite(STDERR, \"could not write \$config_path\n\");

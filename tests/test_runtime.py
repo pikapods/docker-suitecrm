@@ -309,6 +309,23 @@ def test_db_reconcile_on_restart(stack):
     assert "skipping silent install" in logs, \
         "restart boot did not log the skip-install message"
 
+    # Reconcile also merges the APP_URL host into http_referer.list so saves
+    # work behind a reverse proxy (checkHTTPReferer compares Referer host vs
+    # SERVER_NAME, not site_url). APP_URL=http://localhost:8080 → host
+    # "localhost"; its presence in the config'd list is unambiguous proof our
+    # code ran, since "localhost" is only a hardcoded in-function whitelist
+    # entry otherwise and is never written to config.php by anything else.
+    r = _exec(
+        sc, "php", "-r",
+        'include "/data/config.php";'
+        ' exit(in_array("localhost",'
+        ' $sugar_config["http_referer"]["list"] ?? [], true) ? 0 : 1);',
+    )
+    assert r.returncode == 0, (
+        "APP_URL host not merged into http_referer.list "
+        f"(stdout={r.stdout!r}, stderr={r.stderr!r})"
+    )
+
 
 def test_healthcheck_reports_healthy(stack):
     end = time.time() + HEALTHY_DEADLINE_S
