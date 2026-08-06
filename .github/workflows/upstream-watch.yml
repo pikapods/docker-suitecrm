@@ -10,9 +10,11 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   PHP_VERSION: "8.4"
   # Pinned upstream series (major.minor). Auto-rebuilds only fire for patch
-  # bumps within this line, e.g. 7.15.1 -> 7.15.2. Bump this manually to
-  # opt into a new series; use workflow_dispatch on build.yml for one-off
-  # out-of-series builds.
+  # bumps within this line, e.g. 7.15.1 -> 7.15.2. A newer upstream minor
+  # fails this workflow on purpose (see "Fail on new upstream minor series"):
+  # the image has no DB upgrade path, so changing series is a deliberate
+  # manual decision. Bump this after validating the upgrade; use
+  # workflow_dispatch on build.yml for one-off out-of-series builds.
   SERIES: "7.15"
 
 jobs:
@@ -40,20 +42,39 @@ jobs:
         run: |
           set -euo pipefail
 
-          upstream=$(gh api repos/SuiteCRM/SuiteCRM/releases/latest --jq .tag_name)
-          echo "upstream=${upstream}"
+          # Published release tags, bare (we publish `7.15.1`, not `v7.15.1`).
+          # Deliberately not `releases/latest`: that returns the most recently
+          # *published* release regardless of version, so it stops representing
+          # the pinned line the moment upstream opens a newer one — and every
+          # subsequent in-series patch would go unnoticed.
+          releases="${RUNNER_TEMP}/upstream-releases.txt"
+          gh api 'repos/SuiteCRM/SuiteCRM/releases?per_page=100' \
+            --jq '.[] | select(.draft|not) | select(.prerelease|not) | .tag_name' \
+            | sed 's/^v//' >"${releases}"
 
-          # Strip leading 'v' if present, then take everything before the last dot.
-          upstream_series="${upstream#v}"
-          upstream_series="${upstream_series%.*}"
-          if [ "${upstream_series}" != "${SERIES}" ]; then
-            echo "upstream ${upstream} is outside pinned series ${SERIES}; skipping new-version trigger"
+          # Newest 7.x minor line upstream ships. Scoped to 7.x on purpose:
+          # SuiteCRM 8 is a different architecture, not a series bump.
+          newest_minor=$(grep -E '^7\.[0-9]+\.[0-9]+$' "${releases}" \
+            | cut -d. -f1,2 | sort -Vu | tail -n1 || true)
+
+          # Strictly newer, not merely different: upstream patches older lines
+          # after newer ones (v7.14.9 was published 22s after v7.15.1), and a
+          # backport release must not raise the alarm.
+          if [ -n "${newest_minor}" ] && [ "${newest_minor}" != "${SERIES}" ] && \
+             [ "$(printf '%s\n%s\n' "${SERIES}" "${newest_minor}" | sort -V | tail -n1)" = "${newest_minor}" ]; then
+            echo "new_minor=${newest_minor}" >>"$GITHUB_OUTPUT"
+          fi
+
+          # Highest patch in the pinned series. The regex also drops tags
+          # belonging to no patch line, e.g. v7.14.0-beta.
+          upstream_tag=$(grep -E "^${SERIES}\.[0-9]+$" "${releases}" | sort -V | tail -n1 || true)
+
+          if [ -z "${upstream_tag}" ]; then
+            echo "no published release in series ${SERIES}"
             echo "needs_build=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-
-          # We publish as plain `7.15.1`, not `v7.15.1`.
-          upstream_tag="${upstream#v}"
+          echo "latest in-series upstream release: ${upstream_tag}"
           echo "upstream_tag=${upstream_tag}" >>"$GITHUB_OUTPUT"
 
           # Ask GHCR's OCI registry whether the tag is already published.
@@ -67,10 +88,10 @@ jobs:
 
           if [ "${status}" = "200" ]; then
             echo "needs_build=false" >>"$GITHUB_OUTPUT"
-            echo "${upstream} already published"
+            echo "${upstream_tag} already published"
           else
             echo "needs_build=true" >>"$GITHUB_OUTPUT"
-            echo "${upstream} not in registry (HTTP ${status}); will trigger build"
+            echo "${upstream_tag} not in registry (HTTP ${status}); will trigger build"
           fi
 
       - name: Trigger build (new upstream version)
@@ -162,3 +183,18 @@ jobs:
             -f suitecrm_version='${{ steps.drift.outputs.suitecrm_version }}' \
             -f php_version='${{ env.PHP_VERSION }}' \
             -f base_digest='${{ steps.drift.outputs.base_digest }}'
+
+      # A newer upstream minor is a decision, not an automation input: the image
+      # has no DB upgrade path, so we surface it as a workflow failure (which is
+      # already monitored) rather than silently pinning forever.
+      #
+      # Deliberately last, and deliberately not an early exit in the check step:
+      # failing before the triggers above would block in-series patch builds and
+      # base-drift rebuilds until someone bumps SERIES, turning an alert into an
+      # outage of the automation. always() keeps the signal from being swallowed
+      # by an unrelated transient failure in the drift check.
+      - name: Fail on new upstream minor series
+        if: always() && steps.upstream.outputs.new_minor != ''
+        run: |
+          echo "::error::SuiteCRM ${{ steps.upstream.outputs.new_minor }} is available; pinned SERIES is ${{ env.SERIES }}. In-series builds still ran. Validate the upgrade, then bump SERIES in .github/workflows/upstream-watch.yml."
+          exit 1
