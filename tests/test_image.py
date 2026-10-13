@@ -121,6 +121,14 @@ class TestImageFilesystem:
         )
         assert r.returncode == 0, "cron dependency marker on bootstrap missing"
 
+    def test_s6_cron_in_user_bundle(self):
+        # s6-overlay >= 3.2.3.2 reads bundles from user-bundles.d; a leftover
+        # s6-rc.d/user makes rc.init try to migrate it and abort as non-root.
+        r = _run("test", "-f", "/etc/s6-overlay/user-bundles.d/user/contents.d/suitecrm-cron")
+        assert r.returncode == 0, "suitecrm-cron not registered in user-bundles.d/user"
+        r = _run("test", "-e", "/etc/s6-overlay/s6-rc.d/user")
+        assert r.returncode != 0, "legacy /etc/s6-overlay/s6-rc.d/user bundle present"
+
     def test_s6_bootstrap_oneshot_installed(self):
         r = _run("sh", "-c", "ls /etc/s6-overlay/scripts/ | grep -E 'suitecrm-bootstrap'")
         assert r.returncode == 0, (
